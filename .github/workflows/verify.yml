@@ -105,9 +105,11 @@ jobs:
                       var reader = res.GetReader((int)m.Offset, res.Length-(int)m.Offset);
                       var raw = reader.ReadBytes(reader.ReadInt32());
                       var n = md.GetString(m.Name);
-                      result["resource/"+n] = $"{raw.Length}:{H(raw)}";
+                      if (n.StartsWith("Capri.Words.")) result["normalizedWords/"+n]=H(System.Text.Encoding.UTF8.GetBytes(System.Text.Encoding.UTF8.GetString(raw).Replace("\r\n","\n")));
+            result["resource/"+n] = $"{raw.Length}:{H(raw)}";
                       if(n.EndsWith(".dll",StringComparison.OrdinalIgnoreCase)) Pe(raw,n,false);
                   }
+                  var ops=typeof(System.Reflection.Emit.OpCodes).GetFields().Where(f=>f.FieldType==typeof(System.Reflection.Emit.OpCode)).Select(f=>(System.Reflection.Emit.OpCode)f.GetValue(null)!).GroupBy(o=>(ushort)o.Value).ToDictionary(g=>g.Key,g=>g.First());
                   foreach(var h in md.MethodDefinitions) {
                       var m=md.GetMethodDefinition(h);
                       var type=md.GetTypeDefinition(m.GetDeclaringType());
@@ -115,7 +117,19 @@ jobs:
                       var val = H(md.GetBlobBytes(m.Signature));
                       if(m.RelativeVirtualAddress!=0) {
                           var body=pe.GetMethodBody(m.RelativeVirtualAddress);
-                          val += ":"+H(pe.GetSectionData(m.RelativeVirtualAddress).GetContent(0,body.Size).ToArray());
+
+                var il=body.GetILBytes()!;var literals=new List<string>();int i=0;
+                while(i<il.Length){
+                    int op=il[i++]; if(op==254)op=65280+il[i++];
+                    var arg=ops[(ushort)op].OperandType;
+                    if(arg==System.Reflection.Emit.OperandType.InlineString){
+                       var tok=BitConverter.ToInt32(il,i); var literal=md.GetUserString(MetadataTokens.UserStringHandle(tok & 0xffffff)).Replace("\r\n","\n");
+                       literals.Add(H(System.Text.Encoding.Unicode.GetBytes(literal)));Array.Clear(il,i,4);
+                    }
+                    i+=arg.ToString() switch {"InlineNone"=>0,"ShortInlineBrTarget" or "ShortInlineI" or "ShortInlineVar"=>1,"InlineVar"=>2,"InlineI8" or "InlineR"=>8,"InlineSwitch"=>4+4*BitConverter.ToInt32(il,i),_=>4};
+                }
+                result["normalizedIL/"+id]=val+":"+H(il)+":"+string.Join(",",literals);
+                val += ":"+H(pe.GetSectionData(m.RelativeVirtualAddress).GetContent(0,body.Size).ToArray());
                       }
                       result["method/"+id]=val;
                   }
@@ -128,11 +142,11 @@ jobs:
               Pe(data,"Capri",true);return result;
           }
           var a=Inspect(args[0],"independent");var b=Inspect(args[1],"official");
-          foreach(var category in new[]{"resource/","method/","heap/","section/"}) {
+          foreach(var category in new[]{"normalizedWords/","normalizedIL/","resource/","method/","heap/","section/"}) {
               var keys=a.Keys.Union(b.Keys).Where(k=>k.StartsWith(category)).ToArray();
               var diff=keys.Where(k=>a.GetValueOrDefault(k)!=b.GetValueOrDefault(k)).ToArray();
               Console.WriteLine($"{category} compared={keys.Length} different={diff.Length}");
-              foreach(var k in diff.Take(40)) Console.WriteLine($"{k} independent={a.GetValueOrDefault(k)} official={b.GetValueOrDefault(k)}");
+              foreach(var k in diff.Take(3)) Console.WriteLine($"{k} independent={a.GetValueOrDefault(k)} official={b.GetValueOrDefault(k)}");
           }
           '@ | Set-Content "$dir/Program.cs"
           dotnet run --project $dir -- "$env:RUNNER_TEMP/capri-output/Capri.exe" $official | Tee-Object -Variable report
