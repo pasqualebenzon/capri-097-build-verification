@@ -1,0 +1,64 @@
+name: Verify Capri 0.9.7
+on: workflow_dispatch
+permissions: {}
+jobs:
+  verify:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Check runner and test Defender
+        shell: pwsh
+        run: |
+          "Image $env:ImageOS $env:ImageVersion" >> $env:GITHUB_STEP_SUMMARY
+          $ready = $false
+          $probe = Join-Path $env:RUNNER_TEMP 'benign-probe.txt'
+          Set-Content $probe 'Harmless scanner readiness test'
+          try {
+            $status = Get-MpComputerStatus -ErrorAction Stop
+            "Defender antivirus=$($status.AntivirusEnabled), realtime=$($status.RealTimeProtectionEnabled), engine=$($status.AMEngineVersion), signatures=$($status.AntivirusSignatureVersion), updated=$($status.AntivirusSignatureLastUpdated)" >> $env:GITHUB_STEP_SUMMARY
+            $scanner = (Get-ChildItem "$env:ProgramData/Microsoft/Windows Defender/Platform/*/MpCmdRun.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+            if (!$scanner) { $scanner = "$env:ProgramFiles/Windows Defender/MpCmdRun.exe" }
+            if (!$status.AntivirusEnabled -or !$status.AntivirusSignatureVersion) { throw 'Antivirus or signatures unavailable' }
+            & $scanner -Scan -ScanType 3 -File $probe
+            if ($LASTEXITCODE -ne 0) { throw "Probe returned $LASTEXITCODE" }
+            $ready = $true
+            "SCANNER=$scanner" >> $env:GITHUB_ENV
+          } catch { "Defender probe unavailable: $($_.Exception.Message)" >> $env:GITHUB_STEP_SUMMARY }
+          "SCAN_READY=$ready" >> $env:GITHUB_ENV
+          exit 0
+      - name: Fetch original source and build without smoke tests
+        shell: pwsh
+        run: |
+          $sha = '508e075e52907d6c1c4fd7c3376ee3f49d260110'
+          git -c core.autocrlf=false clone --quiet --depth 1 --branch v0.9.7 https://github.com/lachydotmcg/capri-desktop.git source
+          if ($LASTEXITCODE -ne 0 -or (git -C source rev-parse HEAD) -ne $sha) { throw 'Source revision mismatch' }
+          "Source commit: $sha" >> $env:GITHUB_STEP_SUMMARY
+          $csc = Get-Item "$env:WINDIR/Microsoft.NET/Framework64/v4.0.30319/csc.exe"
+          "C# compiler $($csc.VersionInfo.FileVersion)" >> $env:GITHUB_STEP_SUMMARY
+          & ./source/ci/build-windows.ps1 -OutputDirectory "$env:RUNNER_TEMP/capri-output"
+      - name: Hash and check full output
+        shell: pwsh
+        run: |
+          $root = "$env:RUNNER_TEMP/capri-output"
+          $official = 'f9d1e6dd4c01ada261f4cf6e2ae199262d2fa9dd7ab5717bbea0b41c85908121'
+          foreach ($name in 'Capri.exe','Capri-Setup.exe','camera/CapriCamera32.dll','camera/CapriCamera64.dll') {
+            $file = Get-Item (Join-Path $root $name) -ErrorAction Stop
+            $hash = (Get-FileHash $file.FullName).Hash.ToLowerInvariant()
+            $sig = (Get-AuthenticodeSignature $file.FullName).Status
+            "$name | $($file.Length) bytes | SHA256 $hash | Authenticode $sig" >> $env:GITHUB_STEP_SUMMARY
+            if ($name -eq 'Capri.exe') { $appHash = $hash; "Matches official EXE: $($hash -eq $official)" >> $env:GITHUB_STEP_SUMMARY }
+            if ($name -eq 'Capri-Setup.exe' -and $hash -ne $appHash) { throw 'Installer and app differ' }
+          }
+      - name: Scan build output
+        shell: pwsh
+        run: |
+          if ($env:SCAN_READY -ne 'True') { throw 'Build output scan unavailable' }
+          $start = Get-Date
+          & $env:SCANNER -Scan -ScanType 3 -File "$env:RUNNER_TEMP/capri-output"
+          $code = $LASTEXITCODE
+          $events = @(Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Windows Defender/Operational';Id=1116,1117;StartTime=$start} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'capri-output' })
+          "Defender output scan exit=$code, related detection/action events=$($events.Count)" >> $env:GITHUB_STEP_SUMMARY
+          if ($code -ne 0 -or $events.Count) { throw 'Defender detection or scan error' }
+          foreach ($name in 'Capri.exe','Capri-Setup.exe','camera/CapriCamera32.dll','camera/CapriCamera64.dll') {
+            if (!(Test-Path "$env:RUNNER_TEMP/capri-output/$name")) { throw 'Output missing after scan' }
+          }
