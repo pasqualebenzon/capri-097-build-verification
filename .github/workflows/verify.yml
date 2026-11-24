@@ -14,6 +14,7 @@ jobs:
           $probe = Join-Path $env:RUNNER_TEMP 'benign-probe.txt'
           Set-Content $probe 'Harmless scanner readiness test'
           try {
+            try { Update-MpSignature -ErrorAction Stop; "Signature update check succeeded" >> $env:GITHUB_STEP_SUMMARY } catch { "Signature update failed: $($_.Exception.Message)" >> $env:GITHUB_STEP_SUMMARY }
             $status = Get-MpComputerStatus -ErrorAction Stop
             "Defender antivirus=$($status.AntivirusEnabled), realtime=$($status.RealTimeProtectionEnabled), engine=$($status.AMEngineVersion), signatures=$($status.AntivirusSignatureVersion), updated=$($status.AntivirusSignatureLastUpdated)" >> $env:GITHUB_STEP_SUMMARY
             $scanner = (Get-ChildItem "$env:ProgramData/Microsoft/Windows Defender/Platform/*/MpCmdRun.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
@@ -62,3 +63,78 @@ jobs:
           foreach ($name in 'Capri.exe','Capri-Setup.exe','camera/CapriCamera32.dll','camera/CapriCamera64.dll') {
             if (!(Test-Path "$env:RUNNER_TEMP/capri-output/$name")) { throw 'Output missing after scan' }
           }
+      - name: Inspect PE and managed metadata as data
+        shell: pwsh
+        run: |
+          $official = "$env:RUNNER_TEMP/official.exe"
+          Invoke-WebRequest 'https://github.com/lachydotmcg/capri-desktop/releases/download/v0.9.7/Capri.exe' -OutFile $official
+          if ((Get-FileHash $official).Hash -ne 'f9d1e6dd4c01ada261f4cf6e2ae199262d2fa9dd7ab5717bbea0b41c85908121') { throw 'Release digest mismatch' }
+          & $env:SCANNER -Scan -ScanType 3 -File $official
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path $official)) { throw 'Official sample scan blocked or failed' }
+          $dir = "$env:RUNNER_TEMP/Inspector"
+          dotnet new console -o $dir --no-restore
+          if ($LASTEXITCODE) { throw 'Inspector setup failed' }
+          @'
+          using System.Reflection.Metadata;
+          using System.Reflection.Metadata.Ecma335;
+          using System.Reflection.PortableExecutable;
+          using System.Security.Cryptography;
+          
+          static string H(byte[] b) => Convert.ToHexString(SHA256.HashData(b));
+          static Dictionary<string,string> Inspect(string path, string label) {
+              var data = File.ReadAllBytes(path);
+              var result = new Dictionary<string,string>();
+              void Pe(byte[] bytes, string name, bool managed) {
+                  using var s = new MemoryStream(bytes);
+                  using var pe = new PEReader(s);
+                  var headers = pe.PEHeaders;
+                  var opt = headers.PEHeader!;
+                  Console.WriteLine($"{label} {name}: {bytes.Length} bytes; linker {opt.MajorLinkerVersion}.{opt.MinorLinkerVersion}; timestamp {headers.CoffHeader.TimeDateStamp:X8}");
+                  foreach (var sec in headers.SectionHeaders) {
+                      var raw = bytes.AsSpan(sec.PointerToRawData, sec.SizeOfRawData).ToArray();
+                      result[$"section/{name}/{sec.Name}"] = $"{raw.Length}:{H(raw)}";
+                      Console.WriteLine($"  {sec.Name} raw={raw.Length} virtual={sec.VirtualSize} sha={H(raw)}");
+                  }
+                  if (!managed) return;
+                  var md = pe.GetMetadataReader();
+                  var cor = headers.CorHeader!;
+                  var res = pe.GetSectionData(cor.ResourcesDirectory.RelativeVirtualAddress);
+                  foreach (var handle in md.ManifestResources) {
+                      var m = md.GetManifestResource(handle);
+                      if (!m.Implementation.IsNil) throw new Exception("External resource");
+                      var reader = res.GetReader((int)m.Offset, res.Length-(int)m.Offset);
+                      var raw = reader.ReadBytes(reader.ReadInt32());
+                      var n = md.GetString(m.Name);
+                      result["resource/"+n] = $"{raw.Length}:{H(raw)}";
+                      if(n.EndsWith(".dll",StringComparison.OrdinalIgnoreCase)) Pe(raw,n,false);
+                  }
+                  foreach(var h in md.MethodDefinitions) {
+                      var m=md.GetMethodDefinition(h);
+                      var type=md.GetTypeDefinition(m.GetDeclaringType());
+                      var id=MetadataTokens.GetToken(h).ToString("X8")+"/"+md.GetString(type.Name)+"."+md.GetString(m.Name);
+                      var val = H(md.GetBlobBytes(m.Signature));
+                      if(m.RelativeVirtualAddress!=0) {
+                          var body=pe.GetMethodBody(m.RelativeVirtualAddress);
+                          val += ":"+H(pe.GetSectionData(m.RelativeVirtualAddress).GetContent(0,body.Size).ToArray());
+                      }
+                      result["method/"+id]=val;
+                  }
+                  foreach(var heap in Enum.GetValues<HeapIndex>()) {
+                      int off=md.GetHeapMetadataOffset(heap), len=md.GetHeapSize(heap);
+                      result["heap/"+heap]=len+":"+H(pe.GetMetadata().GetContent(off,len).ToArray());
+                  }
+                  Console.WriteLine($"metadata={cor.MetadataDirectory.Size} resources={cor.ResourcesDirectory.Size} MVID={md.GetGuid(md.GetModuleDefinition().Mvid)}");
+              }
+              Pe(data,"Capri",true);return result;
+          }
+          var a=Inspect(args[0],"independent");var b=Inspect(args[1],"official");
+          foreach(var category in new[]{"resource/","method/","heap/","section/"}) {
+              var keys=a.Keys.Union(b.Keys).Where(k=>k.StartsWith(category)).ToArray();
+              var diff=keys.Where(k=>a.GetValueOrDefault(k)!=b.GetValueOrDefault(k)).ToArray();
+              Console.WriteLine($"{category} compared={keys.Length} different={diff.Length}");
+              foreach(var k in diff.Take(40)) Console.WriteLine($"{k} independent={a.GetValueOrDefault(k)} official={b.GetValueOrDefault(k)}");
+          }
+          '@ | Set-Content "$dir/Program.cs"
+          dotnet run --project $dir -- "$env:RUNNER_TEMP/capri-output/Capri.exe" $official | Tee-Object -Variable report
+          if ($LASTEXITCODE) { throw 'Static inspection failed' }
+          $report >> $env:GITHUB_STEP_SUMMARY
