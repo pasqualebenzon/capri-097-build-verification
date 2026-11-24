@@ -120,7 +120,7 @@ jobs:
 
                 var il=body.GetILBytes()!;var literals=new List<string>();int i=0;
                 while(i<il.Length){
-                    int op=il[i++]; if(op==254)op=65280+il[i++];
+                    int op=il[i++]; if(op==254)op=0xFE00+il[i++];
                     var arg=ops[(ushort)op].OperandType;
                     if(arg==System.Reflection.Emit.OperandType.InlineString){
                        var tok=BitConverter.ToInt32(il,i); var literal=md.GetUserString(MetadataTokens.UserStringHandle(tok & 0xffffff)).Replace("\r\n","\n");
